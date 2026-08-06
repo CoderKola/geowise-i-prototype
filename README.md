@@ -93,4 +93,22 @@ Points appear in Terminal 1's log and draw live on the dashboard map.
   `apps/server/geowise-ingest.db*`, restart.
 - Mobile is **pinned to Expo SDK 54** (device Expo Go cap) with exact-pinned deps
   (`.npmrc save-exact`). Add Expo packages with `npx expo install <pkg>`, then pin exact.
-```
+
+## Dev workflow glossary
+
+The three apps each run a dev server. You don't stare at the server — it feeds the
+thing you actually look at (phone or browser) and hot-reloads on save.
+
+| Term | What it is |
+|---|---|
+| **Metro** | React Native's JS bundler + dev server (`npx expo start`, port 8081). Bundles `apps/mobile` and serves it to Expo Go on the phone; hot-reloads on save. This is the "Metro on 8081" you'll see. |
+| **Expo Go** | The app on the phone that loads your bundle from Metro (via QR). No native build needed — the native modules are baked into Expo Go, which is why the SDK must match (54). |
+| **Vite** | The web dashboard's bundler + dev server (`npm run dev`, port 5173). Same idea as Metro, for `apps/web`. Open it in the laptop browser. |
+| **cloudflared** | Cloudflare's tunnel client. Exposes the laptop ingest (:3000) at a temporary public `https://…trycloudflare.com` URL so the phone can reach it over cellular. |
+| **`--clear`** | `npx expo start --clear` wipes Metro's cache. Use it after installing a new native package if something renders stale (missing icons/fonts). |
+
+**Stopping a dev server:** Ctrl+C in its terminal. Metro/Vite keep running until you do.
+
+## Documentation
+
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — phased plan: what's built, what's next.

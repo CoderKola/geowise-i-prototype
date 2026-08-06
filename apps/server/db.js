@@ -2,8 +2,8 @@ const Database = require('better-sqlite3');
 const path = require('path');
 
 // Local SQLite store for ingested points. Mirrors the app's points schema
-// (Traccar/OsmAnd columns) plus server_received_at. UNIQUE(device_id, point_id)
-// makes ingest idempotent — retried batches never duplicate.
+// plus server_received_at. UNIQUE(device_id, point_id) makes ingest
+// idempotent — retried batches never duplicate.
 
 const db = new Database(path.join(__dirname, 'geowise-ingest.db'));
 db.pragma('journal_mode = WAL');

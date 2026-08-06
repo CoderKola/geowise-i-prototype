@@ -1,6 +1,6 @@
 // Shared row types — mirror the SQLite schema in src/db/database.ts.
-// Column set adopted from Traccar's OsmAnd protocol so the data is already
-// shaped for future HTTP upload (Phase 3).
+// Column set is shaped as a GPS telemetry record so the data is already
+// ready for HTTP upload (Phase 2/3).
 
 export interface Session {
   session_id: number;
