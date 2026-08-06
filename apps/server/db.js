@@ -72,4 +72,30 @@ function insertPoints(points) {
   return tx(points);
 }
 
-module.exports = { db, insertPoints };
+// --- read queries for the local dashboard feed (:3100) ---
+
+const listSessionsStmt = db.prepare(`
+  SELECT device_id, session_id,
+         COUNT(*)       AS points,
+         MIN(timestamp) AS started_at,
+         MAX(timestamp) AS ended_at
+  FROM points
+  GROUP BY device_id, session_id
+  ORDER BY ended_at DESC
+`);
+function listSessions() {
+  return listSessionsStmt.all();
+}
+
+const sessionPointsStmt = db.prepare(`
+  SELECT point_id, timestamp, lat, lon, accuracy, altitude, speed, bearing,
+         device_battery, battery_charging, network_type
+  FROM points
+  WHERE device_id IS ? AND session_id IS ?
+  ORDER BY timestamp
+`);
+function sessionPoints(deviceId, sessionId) {
+  return sessionPointsStmt.all(deviceId, sessionId);
+}
+
+module.exports = { db, insertPoints, listSessions, sessionPoints };

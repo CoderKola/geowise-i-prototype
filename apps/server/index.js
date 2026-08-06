@@ -1,10 +1,17 @@
 require('dotenv').config();
 const express = require('express');
+const { EventEmitter } = require('events');
 const { BatchSchema } = require('./schema');
 const { insertPoints } = require('./db');
+const { startFeed } = require('./feed');
 
 const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.UPLOAD_TOKEN;
+
+// In-process bus: ingest (:3000) publishes accepted points, the dashboard
+// feed (:3100) subscribes and streams them to the local browser.
+const bus = new EventEmitter();
+bus.setMaxListeners(0);
 
 if (!TOKEN) {
   console.error(
@@ -41,6 +48,7 @@ app.post('/points', (req, res) => {
         `${p.lat},${p.lon} acc=${p.accuracy} spd=${p.speed}`
     );
   }
+  bus.emit('points', parsed.data.points); // -> live dashboard
   res.json({ ok: true, accepted });
 });
 
@@ -58,3 +66,6 @@ app.listen(PORT, '127.0.0.1', () => {
   console.log(`geowise ingest server listening on http://127.0.0.1:${PORT}`);
   console.log(`Expose it:  cloudflared tunnel --url http://localhost:${PORT}`);
 });
+
+// Local-only dashboard feed (never tunneled).
+startFeed(bus);
