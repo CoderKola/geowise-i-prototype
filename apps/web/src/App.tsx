@@ -15,6 +15,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { TrackMap } from '@/components/TrackMap'
+import { PlaybackBar } from '@/components/PlaybackBar'
+import { usePlayback } from '@/hooks/usePlayback'
 import {
   fetchPoints,
   fetchSessions,
@@ -135,6 +137,8 @@ export default function App() {
 
   const live = lastLiveAt != null && Date.now() - lastLiveAt < 30000
 
+  const playback = usePlayback(points)
+
   const stats = useMemo(() => {
     const coords = points.filter((p) => p.lat != null && p.lon != null)
     let dist = 0
@@ -224,8 +228,15 @@ export default function App() {
 
       {/* map + sessions */}
       <div className="grid flex-1 grid-cols-1 gap-4 lg:grid-cols-[1fr_300px]">
-        <Card className="min-h-[420px] p-2 lg:min-h-[520px]">
-          <TrackMap points={points} live={live} />
+        <Card className="min-h-[420px] gap-2 p-2 lg:min-h-[520px]">
+          <div className="min-h-0 flex-1">
+            <TrackMap
+              points={points}
+              live={live && !playback.active}
+              playheadTs={playback.playheadTs}
+            />
+          </div>
+          <PlaybackBar playback={playback} />
         </Card>
 
         <Card className="gap-3">
