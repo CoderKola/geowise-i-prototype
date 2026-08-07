@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { Point } from '@/lib/api'
+import type { MediaSegment, Point } from '@/lib/api'
 
 export const PLAYBACK_SPEEDS = [1, 2, 5, 10, 30] as const
 export type PlaybackSpeed = (typeof PLAYBACK_SPEEDS)[number]
@@ -34,18 +34,33 @@ const SYNC_THRESHOLD_MS = 120
  * Drives a playhead across a session's timestamp range with requestAnimationFrame.
  * Playback advances in session time (wall-clock at 1×), so recording gaps —
  * phone asleep, standing still — replay at their true duration scaled by speed.
+ *
+ * The timeline range comes from the GPS coords; video-only sessions (media but
+ * no fixes — e.g. a ride whose points were lost) fall back to the chunks'
+ * time range so the video is still scrubbable.
  */
-export function usePlayback(points: Point[]): Playback {
+export function usePlayback(points: Point[], media: MediaSegment[] = []): Playback {
   const range = useMemo(() => {
     const coords = points.filter((p) => p.lat != null && p.lon != null)
-    return coords.length > 0
-      ? {
-          start: coords[0].timestamp,
-          end: coords[coords.length - 1].timestamp,
-          firstId: coords[0].point_id,
-        }
-      : { start: null, end: null, firstId: null }
-  }, [points])
+    if (coords.length > 0) {
+      return {
+        start: coords[0].timestamp,
+        end: coords[coords.length - 1].timestamp,
+        firstId: coords[0].point_id,
+      }
+    }
+    if (media.length > 0) {
+      let start = Infinity
+      let end = -Infinity
+      for (const m of media) {
+        if (m.started_at < start) start = m.started_at
+        if (m.ended_at > end) end = m.ended_at
+      }
+      // firstId keyed off the media range so a session switch still resets.
+      return { start, end, firstId: -start }
+    }
+    return { start: null, end: null, firstId: null }
+  }, [points, media])
 
   const [playing, setPlaying] = useState(false)
   const [speed, setSpeed] = useState<PlaybackSpeed>(10)

@@ -198,7 +198,7 @@ export default function App() {
   const live = connected && lastFixTs != null && now - lastFixTs < LIVE_WINDOW_MS
   const feedStatus: FeedStatus = !connected ? 'offline' : live ? 'live' : 'stale'
 
-  const playback = usePlayback(points)
+  const playback = usePlayback(points, media)
   const mediaCache = useMediaCache(media, playback.playheadTs)
 
   const stats = useMemo(() => {

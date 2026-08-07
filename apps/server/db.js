@@ -174,15 +174,32 @@ function insertPoints(points) {
 
 // --- read queries for the local dashboard feed (:3100) ---
 
+// Sessions come from points, UNIONed with video-only sessions (media arrived
+// but no GPS — e.g. a ride whose points were lost, or video-only capture).
+// Those get their time range from the chunks so they're still viewable.
 const listSessionsStmt = db.prepare(`
-  SELECT p.device_id, p.session_id,
-         COUNT(*)         AS points,
-         MIN(p.timestamp) AS started_at,
-         MAX(p.timestamp) AS ended_at,
-         (SELECT COUNT(*) FROM media_segments m
-           WHERE m.device_id IS p.device_id AND m.session_id IS p.session_id) AS media_segments
-  FROM points p
-  GROUP BY p.device_id, p.session_id
+  SELECT * FROM (
+    SELECT p.device_id, p.session_id,
+           COUNT(*)         AS points,
+           MIN(p.timestamp) AS started_at,
+           MAX(p.timestamp) AS ended_at,
+           (SELECT COUNT(*) FROM media_segments m
+             WHERE m.device_id IS p.device_id AND m.session_id IS p.session_id) AS media_segments
+    FROM points p
+    GROUP BY p.device_id, p.session_id
+    UNION ALL
+    SELECT m.device_id, m.session_id,
+           0                 AS points,
+           MIN(m.started_at) AS started_at,
+           MAX(m.ended_at)   AS ended_at,
+           COUNT(*)          AS media_segments
+    FROM media_segments m
+    WHERE NOT EXISTS (
+      SELECT 1 FROM points p
+      WHERE p.device_id IS m.device_id AND p.session_id IS m.session_id
+    )
+    GROUP BY m.device_id, m.session_id
+  )
   ORDER BY ended_at DESC
 `);
 function listSessions() {
