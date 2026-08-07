@@ -25,6 +25,21 @@ function pad2(n: number): string {
   return String(n).padStart(2, '0');
 }
 
+// Session ids are epoch-seconds since the reinstall-collision fix (legacy
+// installs have small counter ids) — show a time-based title for epoch ids.
+const EPOCH_ID_MIN = 1_000_000_000;
+
+function sessionTitle(s: Session): string {
+  if (s.label != null) return s.label;
+  if (s.session_id >= EPOCH_ID_MIN) {
+    return `Ride ${new Date(s.started_at).toLocaleTimeString([], {
+      hour: 'numeric',
+      minute: '2-digit',
+    })}`;
+  }
+  return `Session ${pad2(s.session_id)}`;
+}
+
 export default function HistoryScreen() {
   const theme = useTheme();
   const t = useTracking();
@@ -56,7 +71,7 @@ export default function HistoryScreen() {
   const onDelete = (s: Session) => {
     Alert.alert(
       'Delete session?',
-      `"${s.label ?? `Session ${pad2(s.session_id)}`}" and its ${counts[s.session_id] ?? 0} points will be removed from this phone. Synced points stay on the server.`,
+      `"${sessionTitle(s)}" and its ${counts[s.session_id] ?? 0} points will be removed from this phone. Synced points stay on the server.`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -112,7 +127,7 @@ export default function HistoryScreen() {
             return (
               <Card key={s.session_id} style={styles.card} mode="elevated">
                 <Card.Title
-                  title={s.label ?? `Session ${pad2(s.session_id)}`}
+                  title={sessionTitle(s)}
                   titleStyle={styles.cardTitle}
                   subtitle={`${new Date(s.started_at).toLocaleString()} · ${counts[s.session_id] ?? 0} points${active ? ' · live' : ''}`}
                   subtitleStyle={active ? { color: ACCENT.go } : undefined}

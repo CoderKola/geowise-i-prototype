@@ -23,6 +23,20 @@ import { haversineMeters, mslAltitudeM, M_TO_FT, MPS_TO_MPH } from '@/lib/geo'
 /** A fix within this window means the pipeline is truly live. */
 const LIVE_WINDOW_MS = 30_000
 
+// Session ids are epoch-seconds since the reinstall-collision fix (legacy
+// sessions keep small counter ids) — epoch ids get a time-based title.
+const EPOCH_ID_MIN = 1_000_000_000
+
+function sessionTitle(s: Session): string {
+  if (s.session_id >= EPOCH_ID_MIN) {
+    return `Ride ${new Date(s.started_at).toLocaleTimeString([], {
+      hour: 'numeric',
+      minute: '2-digit',
+    })}`
+  }
+  return `Session ${s.session_id}`
+}
+
 function fmtAgo(ms: number): string {
   const s = Math.max(0, Math.floor(ms / 1000))
   if (s < 60) return `${s}s ago`
@@ -324,7 +338,7 @@ export default function App() {
                 {isSel && <span className="absolute inset-y-0 left-0 w-0.5 bg-primary" />}
                 <div className="flex items-center justify-between">
                   <span className="flex items-center gap-1.5 text-sm font-medium">
-                    Session {s.session_id}
+                    {sessionTitle(s)}
                     {s.media_segments > 0 ? (
                       <Video className="size-3.5 text-muted-foreground" />
                     ) : null}

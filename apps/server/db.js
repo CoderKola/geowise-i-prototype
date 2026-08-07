@@ -2,8 +2,9 @@ const Database = require('better-sqlite3');
 const path = require('path');
 
 // Local SQLite store for ingested points. Mirrors the app's points schema
-// plus server_received_at. UNIQUE(device_id, point_id) makes ingest
-// idempotent — retried batches never duplicate.
+// plus server_received_at. UNIQUE(device_id, session_id, timestamp) makes
+// ingest idempotent — retried batches never duplicate — while staying safe
+// across app reinstalls (which reset the phone's point_id/session counters).
 
 const db = new Database(path.join(__dirname, 'geowise-ingest.db'));
 db.pragma('journal_mode = WAL');
@@ -32,8 +33,7 @@ db.exec(`
     device_model       TEXT,
     device_type        TEXT,
     os_version         TEXT,
-    server_received_at INTEGER NOT NULL,
-    UNIQUE(device_id, point_id)
+    server_received_at INTEGER NOT NULL
   );
 `);
 
@@ -67,6 +67,64 @@ db.exec(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_points_unique_fix
     ON points(device_id, session_id, timestamp);
 `);
+
+// Migration: drop the legacy inline UNIQUE(device_id, point_id) constraint.
+// The phone's point_id counter is a plain AUTOINCREMENT that resets when the
+// app is reinstalled, so that constraint silently swallowed EVERY point from a
+// reinstalled app as a "duplicate" (server returned 200/accepted:0 and the
+// phone marked them uploaded — permanent loss). A fix's true identity is
+// (device, session, timestamp), enforced by idx_points_unique_fix above.
+// Inline constraints can't be dropped in SQLite, so rebuild the table once.
+const hasLegacyUnique = db
+  .prepare(`PRAGMA index_list(points)`)
+  .all()
+  .some((ix) => {
+    if (ix.origin !== 'u') return false;
+    const cols = db.prepare(`PRAGMA index_info('${ix.name}')`).all().map((c) => c.name);
+    return cols.length === 2 && cols[0] === 'device_id' && cols[1] === 'point_id';
+  });
+if (hasLegacyUnique) {
+  const cols = `device_id, session_id, point_id, timestamp, lat, lon, accuracy,
+    altitude, speed, bearing, device_battery, altitude_accuracy, mocked,
+    pressure, relative_altitude, battery_charging, network_type, platform,
+    device_model, device_type, os_version, server_received_at`;
+  db.exec(`
+    BEGIN;
+    CREATE TABLE points_migrated (
+      id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+      device_id          TEXT,
+      session_id         INTEGER,
+      point_id           INTEGER,
+      timestamp          INTEGER,
+      lat                REAL,
+      lon                REAL,
+      accuracy           REAL,
+      altitude           REAL,
+      speed              REAL,
+      bearing            REAL,
+      device_battery     REAL,
+      altitude_accuracy  REAL,
+      mocked             INTEGER,
+      pressure           REAL,
+      relative_altitude  REAL,
+      battery_charging   INTEGER,
+      network_type       TEXT,
+      platform           TEXT,
+      device_model       TEXT,
+      device_type        TEXT,
+      os_version         TEXT,
+      server_received_at INTEGER NOT NULL
+    );
+    INSERT INTO points_migrated (id, ${cols})
+      SELECT id, ${cols} FROM points;
+    DROP TABLE points;
+    ALTER TABLE points_migrated RENAME TO points;
+    CREATE UNIQUE INDEX idx_points_unique_fix
+      ON points(device_id, session_id, timestamp);
+    COMMIT;
+  `);
+  console.log('[migrate] dropped legacy UNIQUE(device_id, point_id) from points');
+}
 
 // Video segments uploaded by the app (dashcam-style ~15s MP4 chunks). The
 // actual files live in MEDIA_DIR; file_path stores just the file name.

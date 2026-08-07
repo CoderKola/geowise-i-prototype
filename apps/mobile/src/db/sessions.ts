@@ -6,13 +6,29 @@ export async function startSession(
   label: string | null
 ): Promise<number> {
   const db = await getDb();
-  const res = await db.runAsync(
-    'INSERT INTO sessions (device_id, started_at, ended_at, label) VALUES (?, ?, NULL, ?)',
+  // Reinstall-proof session identity: epoch SECONDS at Start, not the table's
+  // AUTOINCREMENT counter. A reinstall wipes this DB and restarts counters at
+  // 1, which used to collide with the same device's earlier sessions on the
+  // server (new rides merged into old ones and their points were dropped as
+  // "duplicates"). Epoch ids can never collide across installs; bump by one
+  // in the (unlikely) case two sessions start within the same second.
+  let sessionId = Math.floor(Date.now() / 1000);
+  for (;;) {
+    const existing = await db.getFirstAsync<{ session_id: number }>(
+      'SELECT session_id FROM sessions WHERE session_id = ?',
+      sessionId
+    );
+    if (existing == null) break;
+    sessionId += 1;
+  }
+  await db.runAsync(
+    'INSERT INTO sessions (session_id, device_id, started_at, ended_at, label) VALUES (?, ?, ?, NULL, ?)',
+    sessionId,
     deviceId,
     Date.now(),
     label
   );
-  return res.lastInsertRowId;
+  return sessionId;
 }
 
 export async function endSession(sessionId: number): Promise<void> {
