@@ -1,0 +1,103 @@
+diff --git a/node_modules/react-native-vision-camera/android/src/main/java/com/margelo/nitro/camera/hybrids/recording/HybridVideoRecorder.kt b/node_modules/react-native-vision-camera/android/src/main/java/com/margelo/nitro/camera/hybrids/recording/HybridVideoRecorder.kt
+index 78cc48c..65c7cb1 100644
+--- a/node_modules/react-native-vision-camera/android/src/main/java/com/margelo/nitro/camera/hybrids/recording/HybridVideoRecorder.kt
++++ b/node_modules/react-native-vision-camera/android/src/main/java/com/margelo/nitro/camera/hybrids/recording/HybridVideoRecorder.kt
+@@ -7,6 +7,7 @@ import com.margelo.nitro.camera.HybridRecorderSpec
+ import com.margelo.nitro.camera.RecordingFinishedReason
+ import com.margelo.nitro.camera.extensions.VideoRecorderError
+ import com.margelo.nitro.camera.extensions.parallel
++import com.margelo.nitro.camera.utils.CustomLifecycle
+ import com.margelo.nitro.camera.utils.IdentifiableExecutor
+ import com.margelo.nitro.core.Promise
+ import com.margelo.nitro.core.resolve
+@@ -51,7 +52,12 @@ class HybridVideoRecorder(
+       this.recordedDuration = 0.0
+       this.recordedFileSize = 0.0
+ 
+-      // Start recording
++      // Start recording.
++      // PATCHED (geowise): Recorder.start() throws IllegalStateException when the
++      // previous recording on the same underlying CameraX Recorder is still
++      // finalizing. Uncaught on this executor thread it kills the whole process,
++      // so surface it as a promise rejection the JS caller can retry instead.
++      try {
+       this.recording =
+         pendingRecording.start(executor) { event ->
+           when (event) {
+@@ -66,6 +72,8 @@ class HybridVideoRecorder(
+               // flips to false even when the finalize was auto-triggered (e.g. by
+               // reaching `maxDuration` / `maxFileSize`) instead of via `stopRecording()`.
+               this.recording = null
++              // PATCHED (geowise): recording ended - release the lifecycle keep-alive.
++              CustomLifecycle.notifyRecordingEnded()
+               if (isCancelled) {
+                 // Recording was cancelled - delete the file and don't notify
+                 isCancelled = false
+@@ -104,6 +112,19 @@ class HybridVideoRecorder(
+             }
+           }
+         }
++      // PATCHED (geowise): recording is live - keep the camera lifecycle alive
++      // across host pause while it runs (see CustomLifecycle). The matching
++      // release happens in the Finalize event, which CameraX always delivers
++      // once start() has returned successfully.
++      CustomLifecycle.notifyRecordingStarted()
++      } catch (error: Throwable) {
++        // PATCHED (geowise): reject instead of crashing the process.
++        this.recording = null
++        if (!didResolve) {
++          promise.reject(error)
++          didResolve = true
++        }
++      }
+     }
+ 
+     return promise
+diff --git a/node_modules/react-native-vision-camera/android/src/main/java/com/margelo/nitro/camera/utils/CustomLifecycle.kt b/node_modules/react-native-vision-camera/android/src/main/java/com/margelo/nitro/camera/utils/CustomLifecycle.kt
+index baf31f0..f9e270d 100644
+--- a/node_modules/react-native-vision-camera/android/src/main/java/com/margelo/nitro/camera/utils/CustomLifecycle.kt
++++ b/node_modules/react-native-vision-camera/android/src/main/java/com/margelo/nitro/camera/utils/CustomLifecycle.kt
+@@ -24,6 +24,24 @@ class CustomLifecycle(
+   LifecycleOwner {
+   companion object {
+     private const val TAG = "CustomLifecycle"
++
++    // PATCHED (geowise): count of currently active video recordings. While > 0,
++    // a host-Activity pause (screen off / backgrounding) must not downgrade the
++    // lifecycle, so the CameraX session stays fully bound and the recording
++    // keeps running. Actually capturing with the screen off additionally
++    // requires a camera-type foreground service (the app declares one via a
++    // config plugin); without it the OS camera service force-disconnects the
++    // backgrounded client and the recording finalizes with SOURCE_INACTIVE —
++    // the same graceful path as before this patch.
++    private val activeRecordings = java.util.concurrent.atomic.AtomicInteger(0)
++
++    fun notifyRecordingStarted() {
++      activeRecordings.incrementAndGet()
++    }
++
++    fun notifyRecordingEnded() {
++      activeRecordings.updateAndGet { count -> if (count > 0) count - 1 else 0 }
++    }
+   }
+ 
+   private val lifecycleRegistry = LifecycleRegistry(this)
+@@ -78,7 +96,17 @@ class CustomLifecycle(
+     val newState =
+       when (context.lifecycleState) {
+         LifecycleState.BEFORE_CREATE -> Lifecycle.State.CREATED
+-        LifecycleState.BEFORE_RESUME -> if (isActive) Lifecycle.State.STARTED else Lifecycle.State.CREATED
++        // PATCHED (geowise): while a recording is in progress, keep the
++        // lifecycle at RESUMED across host pause so nothing downgrades the
++        // camera session mid-recording.
++        LifecycleState.BEFORE_RESUME ->
++          if (isActive && activeRecordings.get() > 0) {
++            Lifecycle.State.RESUMED
++          } else if (isActive) {
++            Lifecycle.State.STARTED
++          } else {
++            Lifecycle.State.CREATED
++          }
+         LifecycleState.RESUMED -> if (isActive) Lifecycle.State.RESUMED else Lifecycle.State.CREATED
+       }
+     moveTo(newState)

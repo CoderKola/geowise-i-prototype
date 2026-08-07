@@ -16,9 +16,19 @@ export interface Playback {
   play: () => void
   pause: () => void
   seek: (ts: number) => void
+  /**
+   * Clock correction from the master video tile: while a video is rendering,
+   * the playhead is derived FROM the frame so GPS and video never drift.
+   * No-op when playback is inactive; small deltas are ignored (the rAF loop
+   * already tracks closely — sub-threshold corrections would only jitter).
+   */
+  syncTo: (ts: number) => void
   setSpeed: (s: PlaybackSpeed) => void
   exit: () => void
 }
+
+/** Ignore master-clock corrections smaller than this (session-time ms). */
+const SYNC_THRESHOLD_MS = 120
 
 /**
  * Drives a playhead across a session's timestamp range with requestAnimationFrame.
@@ -104,6 +114,13 @@ export function usePlayback(points: Point[]): Playback {
     setPlayheadTs(ts)
   }, [])
 
+  const syncTo = useCallback((ts: number) => {
+    if (playheadRef.current == null) return
+    if (Math.abs(ts - playheadRef.current) < SYNC_THRESHOLD_MS) return
+    playheadRef.current = ts
+    setPlayheadTs(ts)
+  }, [])
+
   return {
     active: playheadTs != null,
     playing,
@@ -114,6 +131,7 @@ export function usePlayback(points: Point[]): Playback {
     play,
     pause,
     seek,
+    syncTo,
     setSpeed,
     exit,
   }

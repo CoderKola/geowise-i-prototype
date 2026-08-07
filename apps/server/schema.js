@@ -8,6 +8,16 @@ const nullableNum = z.number().finite().nullable();
 // so the parsed object always carries every key (better-sqlite3 named params).
 const optNum = z.number().finite().nullable().optional().default(null);
 const optInt = z.number().int().nullable().optional().default(null);
+// Identity strings are truncated, not rejected: APKs already in the field can
+// send longer values than planned (e.g. a verbose Android osName), and one
+// overlong label must not block a whole batch of good points.
+const optStr = (max) =>
+  z
+    .string()
+    .transform((s) => s.slice(0, max))
+    .nullable()
+    .optional()
+    .default(null);
 
 const PointSchema = z
   .object({
@@ -28,6 +38,10 @@ const PointSchema = z
     relative_altitude: optNum,
     battery_charging: optInt,
     network_type: z.string().max(32).nullable().optional().default(null),
+    platform: optStr(32),
+    device_model: optStr(64),
+    device_type: optStr(16),
+    os_version: optStr(32),
   })
   .strict();
 
@@ -37,4 +51,19 @@ const BatchSchema = z
   })
   .strict();
 
-module.exports = { PointSchema, BatchSchema };
+// Multipart text fields for /media arrive as strings — coerce the numerics.
+// The app sends device_id as '' when null (FormData can't carry null).
+const MediaMetaSchema = z
+  .object({
+    device_id: z
+      .string()
+      .max(64)
+      .transform((s) => (s === '' ? null : s)),
+    session_id: z.coerce.number().int().nonnegative(),
+    facing: z.enum(['front', 'back']),
+    started_at: z.coerce.number().int().positive(),
+    ended_at: z.coerce.number().int().positive(),
+  })
+  .strict();
+
+module.exports = { PointSchema, BatchSchema, MediaMetaSchema };

@@ -1,8 +1,10 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { ScrollView, StyleSheet, View } from 'react-native';
 import {
   Appbar,
   Button,
+  Icon,
+  IconButton,
   SegmentedButtons,
   Surface,
   Text,
@@ -10,6 +12,10 @@ import {
 } from 'react-native-paper';
 import { useTracking } from '../location/TrackingContext';
 import { useUpload } from '../upload/UploadContext';
+import { needsBatteryExemption, requestBatteryExemption } from '../batteryOptimization';
+import { getCapability } from '../camera/camera';
+import type { CameraCapability } from '../camera/types';
+import DriveMode from './DriveMode';
 import { ACCENT } from '../theme';
 
 const M_TO_FT = 3.28084;
@@ -37,10 +43,55 @@ function Metric({ label, value, color }: { label: string; value: string; color?:
   );
 }
 
+// Compact header label for what the device's cameras can do.
+function capabilityLabel(cap: CameraCapability | null): string {
+  if (cap == null) return '…';
+  switch (cap.mode) {
+    case 'dual':
+      return 'Dual cam';
+    case 'single':
+      return 'Single cam';
+    case 'unavailable':
+      return 'No camera';
+    default: {
+      const exhaustive: never = cap.mode;
+      return exhaustive;
+    }
+  }
+}
+
 export default function TrackScreen() {
   const theme = useTheme();
   const t = useTracking();
   const u = useUpload();
+  const [capability, setCapability] = useState<CameraCapability | null>(null);
+  const [needsExemption, setNeedsExemption] = useState(false);
+  const [exemptionDismissed, setExemptionDismissed] = useState(false);
+
+  useEffect(() => {
+    getCapability().then(setCapability).catch(() => {});
+  }, []);
+
+  // Re-check on mount and whenever tracking starts (Android custom builds
+  // only — needsBatteryExemption resolves false on iOS/Expo Go).
+  useEffect(() => {
+    needsBatteryExemption().then(setNeedsExemption).catch(() => {});
+  }, [t.isTracking]);
+
+  const onRequestExemption = async () => {
+    try {
+      await requestBatteryExemption(); // resolves when the system dialog closes
+    } catch {
+      // dialog unavailable on this OEM — leave the notice up
+    }
+    needsBatteryExemption().then(setNeedsExemption).catch(() => {});
+  };
+
+  // Tracking with an active camera -> full-screen drive mode takes over.
+  // No camera (Expo Go, permission denied) -> the stats layout below remains.
+  if (t.isTracking && t.videoMode != null) {
+    return <DriveMode />;
+  }
 
   const speed = t.speedMph == null ? 0 : t.speedMph;
   const altFt = t.altitude == null ? null : t.altitude * M_TO_FT;
@@ -53,6 +104,25 @@ export default function TrackScreen() {
     <View style={[styles.flex, { backgroundColor: theme.colors.background }]}>
       <Appbar.Header mode="small" elevated>
         <Appbar.Content title="geowise" titleStyle={styles.brand} />
+        {/* camera is always on while tracking — the icon reflects policy, not a toggle */}
+        <View style={styles.recRow}>
+          <Icon
+            source={capability?.mode === 'unavailable' ? 'camera-off' : 'camera'}
+            size={16}
+            color={capability?.mode === 'unavailable' ? theme.colors.onSurfaceVariant : ACCENT.go}
+          />
+          <Text
+            variant="labelMedium"
+            style={{
+              color:
+                capability?.mode === 'unavailable'
+                  ? theme.colors.onSurfaceVariant
+                  : ACCENT.go,
+            }}
+          >
+            {capabilityLabel(capability)}
+          </Text>
+        </View>
         <View style={styles.recRow}>
           <View
             style={[
@@ -67,6 +137,33 @@ export default function TrackScreen() {
       </Appbar.Header>
 
       <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
+        {/* Battery optimization exemption — keeps OEM killers off the tracking service */}
+        {needsExemption && !exemptionDismissed ? (
+          <Surface style={styles.card} elevation={1}>
+            <View style={styles.batteryNoticeRow}>
+              <Icon source="battery-alert" size={22} color={ACCENT.amber} />
+              <Text variant="bodySmall" style={[styles.flexShrink, { flex: 1 }]}>
+                Battery optimization can stop recording mid-trip. Allow geowise to run
+                unrestricted for reliable tracking.
+              </Text>
+              <IconButton
+                icon="close"
+                size={16}
+                onPress={() => setExemptionDismissed(true)}
+                style={styles.batteryNoticeClose}
+              />
+            </View>
+            <Button
+              mode="contained-tonal"
+              icon="battery-check"
+              onPress={onRequestExemption}
+              style={styles.batteryNoticeBtn}
+            >
+              Allow unrestricted battery use
+            </Button>
+          </Surface>
+        ) : null}
+
         {/* Speed hero */}
         <Surface style={styles.card} elevation={1}>
           <Text variant="labelMedium" style={{ color: theme.colors.onSurfaceVariant }}>
@@ -121,6 +218,42 @@ export default function TrackScreen() {
           {t.isTracking ? 'Stop tracking' : 'Start tracking'}
         </Button>
 
+        {/* Camera (always on while tracking — no toggle) */}
+        <Surface style={styles.card} elevation={1}>
+          <View style={styles.videoHeader}>
+            <View style={styles.flexShrink}>
+              <Text variant="titleSmall" style={styles.cardTitle}>
+                Camera
+              </Text>
+              <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>
+                Always records while tracking (screen stays on). Starting a trip switches to
+                full-screen camera mode.
+              </Text>
+            </View>
+            <Icon
+              source={capability?.mode === 'unavailable' ? 'camera-off' : 'camera'}
+              size={22}
+              color={
+                capability?.mode === 'unavailable' ? theme.colors.onSurfaceVariant : ACCENT.go
+              }
+            />
+          </View>
+          {capability?.notice ? (
+            <Text variant="bodySmall" style={{ color: ACCENT.amber, marginTop: 8 }}>
+              {capability.notice}
+            </Text>
+          ) : capability?.mode === 'dual' ? (
+            <Text variant="bodySmall" style={{ color: ACCENT.go, marginTop: 8 }}>
+              Front + back cameras supported.
+            </Text>
+          ) : null}
+          {t.videoNotice ? (
+            <Text variant="bodySmall" style={{ color: ACCENT.amber, marginTop: 6 }}>
+              {t.videoNotice}
+            </Text>
+          ) : null}
+        </Surface>
+
         {/* Sync */}
         <Surface style={styles.card} elevation={1}>
           <Text variant="titleSmall" style={styles.cardTitle}>
@@ -159,6 +292,11 @@ export default function TrackScreen() {
               {u.lastStatus ?? 'standby'}
             </Text>
           </View>
+          {u.pendingMedia > 0 || u.sentMedia > 0 ? (
+            <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 6 }}>
+              Video clips: {u.pendingMedia} pending · {u.sentMedia} sent
+            </Text>
+          ) : null}
           {!u.serverUrl ? (
             <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 8 }}>
               Set the tunnel and token in Settings first.
@@ -196,6 +334,18 @@ const styles = StyleSheet.create({
   trackBtn: { borderRadius: 16 },
   trackBtnContent: { height: 56 },
   trackBtnLabel: { fontSize: 16, fontFamily: 'Inter_700Bold' },
+
+  videoHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  flexShrink: { flexShrink: 1 },
+
+  batteryNoticeRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  batteryNoticeClose: { margin: 0 },
+  batteryNoticeBtn: { marginTop: 10, borderRadius: 12 },
 
   syncNowBtn: { marginTop: 12, borderRadius: 12 },
   syncStatus: {

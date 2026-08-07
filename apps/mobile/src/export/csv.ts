@@ -1,3 +1,4 @@
+import { Platform } from 'react-native';
 import { File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import { getSession } from '../db/sessions';
@@ -25,6 +26,10 @@ const COLUMNS: (keyof Point)[] = [
   'relative_altitude',
   'battery_charging',
   'network_type',
+  'platform',
+  'device_model',
+  'device_type',
+  'os_version',
 ];
 
 function toCsv(points: Point[]): string {
@@ -61,12 +66,19 @@ export async function exportSessionCsv(sessionId: number): Promise<void> {
   file.write(csv);
 
   if (await Sharing.isAvailableAsync()) {
-    // TODO(android): Android's FileProvider needs file.contentUri (content://),
-    // not file.uri (file://). iPhone-first, so file.uri is correct for now.
-    await Sharing.shareAsync(file.uri, {
-      mimeType: 'text/csv',
-      dialogTitle: 'Export session CSV',
-      UTI: 'public.comma-separated-values-text',
-    });
+    if (Platform.OS === 'android') {
+      // Android's FileProvider requires a content:// URI; file:// is rejected.
+      await Sharing.shareAsync(file.contentUri, {
+        mimeType: 'text/csv',
+        dialogTitle: 'Export session CSV',
+      });
+    } else {
+      // iOS (iPhone Expo Go dev loop): file:// URI + UTI for the share sheet.
+      await Sharing.shareAsync(file.uri, {
+        mimeType: 'text/csv',
+        dialogTitle: 'Export session CSV',
+        UTI: 'public.comma-separated-values-text',
+      });
+    }
   }
 }

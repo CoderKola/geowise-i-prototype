@@ -3,14 +3,17 @@ import type { Point } from '../types';
 
 export type NewPoint = Omit<Point, 'point_id'>;
 
-export async function insertPoint(p: NewPoint): Promise<void> {
+// Returns true if a row was actually inserted (false = duplicate ignored).
+export async function insertPoint(p: NewPoint): Promise<boolean> {
   const db = await getDb();
-  await db.runAsync(
-    `INSERT INTO points
+  // OR IGNORE + the unique (session_id, timestamp) index: a re-delivered
+  // location batch silently no-ops instead of duplicating fixes.
+  const res = await db.runAsync(
+    `INSERT OR IGNORE INTO points
        (session_id, device_id, timestamp, lat, lon, accuracy, altitude, speed, bearing,
         device_battery, altitude_accuracy, mocked, pressure, relative_altitude,
-        battery_charging, network_type)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        battery_charging, network_type, platform, device_model, device_type, os_version)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     p.session_id,
     p.device_id,
     p.timestamp,
@@ -26,8 +29,13 @@ export async function insertPoint(p: NewPoint): Promise<void> {
     p.pressure,
     p.relative_altitude,
     p.battery_charging,
-    p.network_type
+    p.network_type,
+    p.platform,
+    p.device_model,
+    p.device_type,
+    p.os_version
   );
+  return res.changes > 0;
 }
 
 export async function getPointsForSession(sessionId: number): Promise<Point[]> {

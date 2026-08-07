@@ -7,24 +7,34 @@ import React, {
   useState,
 } from 'react';
 import * as Location from 'expo-location';
-import * as Battery from 'expo-battery';
-import * as Network from 'expo-network';
+import Constants, { ExecutionEnvironment } from 'expo-constants';
 import { Barometer } from 'expo-sensors';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { getDeviceId } from '../device';
 import { startSession, endSession } from '../db/sessions';
-import { insertPoint } from '../db/points';
+import { countPointsForSession } from '../db/points';
 import { getDb } from '../db/database';
+import {
+  getActiveSession,
+  setActiveSession,
+  clearActiveSession,
+} from '../db/settings';
+import { latestBaro, subscribeWrites, writeLocation, type WrittenPoint } from './pointWriter';
+import { LOCATION_TASK } from './backgroundTask';
+import { startCapture, stopCapture } from '../camera/camera';
+import type { CameraMode } from '../camera/types';
 
-// Below this m/s, GPS jitter reads as movement while standing still — clamp to 0.
-const SPEED_CLAMP = 0.5;
+// Expo Go can't run background location (custom builds only) — fall back to
+// the foreground watcher + keep-awake there so the pinned iPhone still works.
+const IS_EXPO_GO = Constants.executionEnvironment === ExecutionEnvironment.StoreClient;
 
-// Keep-awake tag: screen must not auto-lock mid-recording (foreground-only app;
-// lock = recording stops). Essential for driving sessions with a mounted phone.
+// Keep-awake tag: in foreground-only mode the screen must not auto-lock
+// mid-recording (lock = recording stops). Not needed in background mode.
 const KEEP_AWAKE_TAG = 'geowise-tracking';
 
 export interface LiveState {
   isTracking: boolean;
+  backgroundActive: boolean; // true = OS-level background recording is on
   sessionId: number | null;
   lat: number | null;
   lon: number | null;
@@ -39,6 +49,8 @@ export interface LiveState {
   lastWriteAt: number | null;
   error: string | null;
   lastSessionId: number | null; // last finished session, for export after Stop
+  videoMode: CameraMode | null; // 'dual' | 'single' while video capture runs
+  videoNotice: string | null; // capability/fallback message for the UI
 }
 
 interface TrackingContextValue extends LiveState {
@@ -49,6 +61,7 @@ interface TrackingContextValue extends LiveState {
 
 const initialState: LiveState = {
   isTracking: false,
+  backgroundActive: false,
   sessionId: null,
   lat: null,
   lon: null,
@@ -63,6 +76,8 @@ const initialState: LiveState = {
   lastWriteAt: null,
   error: null,
   lastSessionId: null,
+  videoMode: null,
+  videoNotice: null,
 };
 
 const TrackingContext = createContext<TrackingContextValue | null>(null);
@@ -70,20 +85,88 @@ const TrackingContext = createContext<TrackingContextValue | null>(null);
 export function TrackingProvider({ children }: { children: React.ReactNode }) {
   const subRef = useRef<Location.LocationSubscription | null>(null);
   const baroSubRef = useRef<{ remove: () => void } | null>(null);
-  const baroRef = useRef<{ pressure: number | null; relativeAltitude: number | null }>({
-    pressure: null,
-    relativeAltitude: null,
-  });
+  const unsubWritesRef = useRef<(() => void) | null>(null);
   const sessionIdRef = useRef<number | null>(null);
   const deviceIdRef = useRef<string | null>(null);
   const countRef = useRef(0);
   const [ready, setReady] = useState(false);
   const [state, setState] = useState<LiveState>(initialState);
 
+  // Reflect each written point (from either capture path) into live UI state.
+  const attachWriteListener = useCallback(() => {
+    unsubWritesRef.current?.();
+    unsubWritesRef.current = subscribeWrites((p: WrittenPoint) => {
+      countRef.current += 1;
+      setState((s) => ({
+        ...s,
+        lat: p.lat,
+        lon: p.lon,
+        speedMph: p.speed * 2.23694,
+        bearing: p.bearing,
+        accuracy: p.accuracy,
+        altitude: p.altitude,
+        altitudeAccuracy: p.altitudeAccuracy,
+        batteryPct: p.battery,
+        batteryCharging: p.charging,
+        pointCount: countRef.current,
+        lastWriteAt: Date.now(),
+      }));
+    });
+  }, []);
+
+  // Barometer (if present): keep the latest reading in the shared holder so
+  // both capture paths snapshot it per point.
+  const startBarometer = useCallback(async () => {
+    latestBaro.pressure = null;
+    latestBaro.relativeAltitude = null;
+    try {
+      if (await Barometer.isAvailableAsync()) {
+        baroSubRef.current = Barometer.addListener((d) => {
+          latestBaro.pressure = typeof d.pressure === 'number' ? d.pressure : null;
+          latestBaro.relativeAltitude =
+            typeof (d as any).relativeAltitude === 'number'
+              ? (d as any).relativeAltitude
+              : null;
+        });
+      }
+    } catch {
+      // no barometer; pressure stays null
+    }
+  }, []);
+
   useEffect(() => {
     (async () => {
       await getDb(); // create schema before any Start
       deviceIdRef.current = await getDeviceId();
+
+      // If the OS kept (or relaunched) the background task while the app UI was
+      // killed mid-recording, resume the open session instead of orphaning it.
+      try {
+        const active = await getActiveSession();
+        const bgRunning =
+          !IS_EXPO_GO && (await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK));
+        if (active && bgRunning) {
+          sessionIdRef.current = active.sessionId;
+          countRef.current = await countPointsForSession(active.sessionId);
+          attachWriteListener();
+          await startBarometer();
+          setState((s) => ({
+            ...s,
+            isTracking: true,
+            backgroundActive: true,
+            sessionId: active.sessionId,
+            pointCount: countRef.current,
+          }));
+        } else if (active && !bgRunning) {
+          // Recording died with the app (foreground mode) — close the session.
+          await endSession(active.sessionId);
+          await clearActiveSession();
+          setState((s) => ({ ...s, lastSessionId: active.sessionId }));
+        }
+      } catch {
+        // restore is best-effort; a fresh Start always works
+      }
+
       setReady(true);
     })();
     return () => {
@@ -91,12 +174,14 @@ export function TrackingProvider({ children }: { children: React.ReactNode }) {
       subRef.current = null;
       baroSubRef.current?.remove();
       baroSubRef.current = null;
+      unsubWritesRef.current?.();
+      unsubWritesRef.current = null;
       deactivateKeepAwake(KEEP_AWAKE_TAG); // never leave the screen pinned awake
     };
-  }, []);
+  }, [attachWriteListener, startBarometer]);
 
   const start = useCallback(async () => {
-    if (subRef.current) return; // already tracking
+    if (sessionIdRef.current != null) return; // already tracking
 
     const { status } = await Location.requestForegroundPermissionsAsync();
     if (status !== 'granted') {
@@ -104,135 +189,136 @@ export function TrackingProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
+    // Background recording needs a custom build + "Allow all the time".
+    let background = false;
+    let backgroundNotice: string | null = null;
+    if (!IS_EXPO_GO) {
+      try {
+        const bg = await Location.requestBackgroundPermissionsAsync();
+        background = bg.status === 'granted';
+        if (!background) {
+          backgroundNotice =
+            'Background permission denied — recording works only while the app is open. ' +
+            'Enable "Allow all the time" in location settings for screen-off tracking.';
+        }
+      } catch {
+        background = false;
+      }
+    }
+
     const deviceId = deviceIdRef.current;
     const sessionId = await startSession(deviceId, null);
     sessionIdRef.current = sessionId;
     countRef.current = 0;
+    await setActiveSession(sessionId, deviceId);
     setState((s) => ({
       ...initialState,
       isTracking: true,
+      backgroundActive: background,
       sessionId,
+      error: backgroundNotice,
       lastSessionId: s.lastSessionId,
     }));
 
-    // Keep the screen on while recording — foreground-only app, lock = stop.
-    try {
-      await activateKeepAwakeAsync(KEEP_AWAKE_TAG);
-    } catch {
-      // non-fatal; tracking proceeds without it
-    }
+    attachWriteListener();
+    await startBarometer();
 
-    // Barometer (if present): keep the latest reading in a ref, snapshot per point.
-    baroRef.current = { pressure: null, relativeAltitude: null };
+    // Video capture — camera is ALWAYS on while tracking (no user toggle).
+    // Never blocks GPS tracking: whatever the capability outcome (dual ->
+    // single -> unavailable), the ride still records.
     try {
-      if (await Barometer.isAvailableAsync()) {
-        baroSubRef.current = Barometer.addListener((d) => {
-          baroRef.current = {
-            pressure: typeof d.pressure === 'number' ? d.pressure : null,
-            relativeAltitude:
-              typeof (d as any).relativeAltitude === 'number'
-                ? (d as any).relativeAltitude
-                : null,
-          };
-        });
+      const cap = await startCapture(sessionId, deviceId);
+      setState((s) => ({
+        ...s,
+        videoMode: cap.mode === 'unavailable' ? null : cap.mode,
+        videoNotice: cap.notice,
+      }));
+      // Cameras cannot capture with the screen off (OS restriction), and the
+      // library cannot bind to a camera foreground service — so while video
+      // runs, the screen must not auto-lock. GPS alone doesn't need this
+      // (its foreground service survives screen-off), video always does.
+      if (cap.mode !== 'unavailable') {
+        try {
+          await activateKeepAwakeAsync(KEEP_AWAKE_TAG);
+        } catch {
+          // non-fatal; video simply stops if the screen locks
+        }
       }
-    } catch {
-      // no barometer; pressure stays null
+    } catch (e: unknown) {
+      setState((s) => ({
+        ...s,
+        videoNotice: `Video failed to start: ${e instanceof Error ? e.message : String(e)}`,
+      }));
     }
 
-    subRef.current = await Location.watchPositionAsync(
-      {
+    if (background) {
+      await Location.startLocationUpdatesAsync(LOCATION_TASK, {
         accuracy: Location.Accuracy.BestForNavigation,
         distanceInterval: 10, // metres — distance-based sampling
         timeInterval: 0, // Android-only; 0 = no minimum wait
-      },
-      async (loc) => {
-        const sid = sessionIdRef.current;
-        if (sid == null) return;
-
-        const c = loc.coords;
-        const rawSpeed = c.speed ?? 0;
-        const speed = rawSpeed < SPEED_CLAMP ? 0 : rawSpeed;
-
-        // Best-effort sensor snapshot — a failure of any never drops the point.
-        let battery: number | null = null;
-        let charging: number | null = null;
-        try {
-          const lvl = await Battery.getBatteryLevelAsync();
-          battery = lvl >= 0 ? lvl : null; // -1 when unavailable (e.g. simulator)
-          const st = await Battery.getBatteryStateAsync();
-          charging =
-            st === Battery.BatteryState.CHARGING || st === Battery.BatteryState.FULL
-              ? 1
-              : st === Battery.BatteryState.UNPLUGGED
-                ? 0
-                : null;
-        } catch {
-          /* keep nulls */
-        }
-
-        let networkType: string | null = null;
-        try {
-          const ns = await Network.getNetworkStateAsync();
-          networkType = ns.type ? String(ns.type).toLowerCase() : null;
-        } catch {
-          /* keep null */
-        }
-
-        const baro = baroRef.current;
-
-        await insertPoint({
-          session_id: sid,
-          device_id: deviceId,
-          timestamp: loc.timestamp,
-          lat: c.latitude,
-          lon: c.longitude,
-          accuracy: c.accuracy,
-          altitude: c.altitude,
-          speed,
-          bearing: c.heading,
-          device_battery: battery,
-          altitude_accuracy: c.altitudeAccuracy ?? null,
-          mocked: (loc as any).mocked === true ? 1 : null,
-          pressure: baro.pressure,
-          relative_altitude: baro.relativeAltitude,
-          battery_charging: charging,
-          network_type: networkType,
-        });
-
-        countRef.current += 1;
-        setState((s) => ({
-          ...s,
-          lat: c.latitude,
-          lon: c.longitude,
-          speedMph: speed * 2.23694,
-          bearing: c.heading,
-          accuracy: c.accuracy,
-          altitude: c.altitude,
-          altitudeAccuracy: c.altitudeAccuracy ?? null,
-          batteryPct: battery,
-          batteryCharging: charging,
-          pointCount: countRef.current,
-          lastWriteAt: Date.now(),
-        }));
+        activityType: Location.LocationActivityType.Fitness,
+        pausesUpdatesAutomatically: false,
+        foregroundService: {
+          notificationTitle: 'geowise is recording your trip',
+          notificationBody: 'Location tracking stays on until you press Stop.',
+          killServiceOnDestroy: false,
+        },
+      });
+    } else {
+      // Foreground-only fallback (Expo Go, or background permission denied):
+      // keep the screen on — lock = recording stops.
+      try {
+        await activateKeepAwakeAsync(KEEP_AWAKE_TAG);
+      } catch {
+        // non-fatal; tracking proceeds without it
       }
-    );
-  }, []);
+      subRef.current = await Location.watchPositionAsync(
+        {
+          accuracy: Location.Accuracy.BestForNavigation,
+          distanceInterval: 10,
+          timeInterval: 0,
+        },
+        async (loc) => {
+          const sid = sessionIdRef.current;
+          if (sid == null) return;
+          await writeLocation(sid, deviceId, loc);
+        }
+      );
+    }
+  }, [attachWriteListener, startBarometer]);
 
   const stop = useCallback(async () => {
+    try {
+      await stopCapture(); // finalizes the in-flight video chunk
+    } catch {
+      // camera already stopped or was never started
+    }
     subRef.current?.remove();
     subRef.current = null;
     baroSubRef.current?.remove();
     baroSubRef.current = null;
+    unsubWritesRef.current?.();
+    unsubWritesRef.current = null;
     deactivateKeepAwake(KEEP_AWAKE_TAG);
+    try {
+      if (await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK)) {
+        await Location.stopLocationUpdatesAsync(LOCATION_TASK);
+      }
+    } catch {
+      // task was never started (foreground mode) or already stopped
+    }
     const sid = sessionIdRef.current;
     sessionIdRef.current = null;
+    await clearActiveSession();
     if (sid != null) await endSession(sid);
     setState((s) => ({
       ...s,
       isTracking: false,
+      backgroundActive: false,
       sessionId: null,
       lastSessionId: sid ?? s.lastSessionId,
+      videoMode: null,
+      videoNotice: null,
     }));
   }, []);
 

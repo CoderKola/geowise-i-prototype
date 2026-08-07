@@ -1,78 +1,89 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import {
-  Activity,
-  Battery,
-  BatteryCharging,
-  Clock,
-  Gauge,
-  MapPin,
-  Navigation,
-  RefreshCw,
-  Route,
-  Satellite,
-} from 'lucide-react'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import { Badge } from '@/components/ui/badge'
+import { Navigation, RefreshCw, Satellite, Video } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { TrackMap } from '@/components/TrackMap'
 import { PlaybackBar } from '@/components/PlaybackBar'
+import { MapHud, type HudStats } from '@/components/MapHud'
+import { VideoPanel } from '@/components/VideoPanel'
 import { usePlayback } from '@/hooks/usePlayback'
+import { useMediaCache } from '@/hooks/useMediaCache'
 import {
+  fetchMedia,
   fetchPoints,
   fetchSessions,
   subscribeStream,
+  type MediaSegment,
   type Point,
   type Session,
   type StreamPoint,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { haversineMeters, mslAltitudeM, M_TO_FT, MPS_TO_MPH } from '@/lib/geo'
 
-const MPS_TO_MPH = 2.23694
-const M_TO_FT = 3.28084
+/** A fix within this window means the pipeline is truly live. */
+const LIVE_WINDOW_MS = 30_000
 
-function haversineMeters(a: [number, number], b: [number, number]): number {
-  const R = 6371000
-  const dLat = ((b[0] - a[0]) * Math.PI) / 180
-  const dLon = ((b[1] - a[1]) * Math.PI) / 180
-  const la1 = (a[0] * Math.PI) / 180
-  const la2 = (b[0] * Math.PI) / 180
-  const h =
-    Math.sin(dLat / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) ** 2
-  return 2 * R * Math.asin(Math.sqrt(h))
+function fmtAgo(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  if (s < 60) return `${s}s ago`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ago`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h ago`
+  return `${Math.floor(h / 24)}d ago`
 }
 
-function fmtDuration(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  const h = Math.floor(s / 3600)
-  const m = Math.floor((s % 3600) / 60)
-  const sec = s % 60
-  return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${sec}s` : `${sec}s`
+type FeedStatus = 'live' | 'stale' | 'offline'
+
+const STATUS_STYLE: Record<FeedStatus, { dot: string; text: string; label: string }> = {
+  live: { dot: 'bg-[color:var(--go)]', text: 'text-[color:var(--go)]', label: 'LIVE' },
+  stale: { dot: 'bg-[color:var(--amber)]', text: 'text-[color:var(--amber)]', label: 'STALE' },
+  offline: { dot: 'bg-muted-foreground', text: 'text-muted-foreground', label: 'OFFLINE' },
 }
 
-function Stat({
-  icon: Icon,
-  label,
-  value,
-  sub,
-  accent,
+/**
+ * Three-state pipeline freshness indicator:
+ * LIVE = a fix arrived within the live window; STALE = feed reachable but the
+ * phone has gone quiet; OFFLINE = the SSE connection to the feed is down.
+ * Dimmed during playback of an old session, where freshness is irrelevant.
+ */
+function FeedIndicator({
+  status,
+  lastFixTs,
+  now,
+  dimmed,
 }: {
-  icon: React.ElementType
-  label: string
-  value: string
-  sub?: string
-  accent?: boolean
+  status: FeedStatus
+  lastFixTs: number | null
+  now: number
+  dimmed: boolean
 }) {
+  const style = STATUS_STYLE[status]
   return (
-    <Card className="gap-2 p-4">
-      <div className="flex items-center gap-2 text-muted-foreground">
-        <Icon className="size-4" />
-        <span className="text-xs font-medium tracking-wide uppercase">{label}</span>
-      </div>
-      <div className={cn('font-mono text-2xl font-semibold', accent && 'text-[color:var(--go)]')}>
-        {value}
-      </div>
-      {sub ? <div className="text-xs text-muted-foreground">{sub}</div> : null}
-    </Card>
+    <span
+      className={cn(
+        'flex items-center gap-1.5 font-mono text-xs transition-opacity',
+        dimmed && 'opacity-40',
+      )}
+    >
+      <span className={cn('size-2', style.dot)} />
+      <span className={cn('font-semibold tracking-wide', style.text)}>{style.label}</span>
+      {status !== 'offline' && lastFixTs != null && (
+        <span className="text-muted-foreground">· {fmtAgo(now - lastFixTs)}</span>
+      )}
+    </span>
+  )
+}
+
+/** Thin uppercase strip used as a flat panel header. */
+function PanelLabel({ children, aside }: { children: React.ReactNode; aside?: React.ReactNode }) {
+  return (
+    <div className="flex shrink-0 items-center justify-between border-b bg-secondary px-3 py-1.5">
+      <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-secondary-foreground">
+        {children}
+      </span>
+      {aside}
+    </div>
   )
 }
 
@@ -80,21 +91,34 @@ export default function App() {
   const [sessions, setSessions] = useState<Session[]>([])
   const [selected, setSelected] = useState<{ device: string | null; session: number } | null>(null)
   const [points, setPoints] = useState<Point[]>([])
+  const [media, setMedia] = useState<MediaSegment[]>([])
   const [connected, setConnected] = useState(false)
-  const [lastLiveAt, setLastLiveAt] = useState<number | null>(null)
+  // Newest fix timestamp seen anywhere in the pipeline (any device/session).
+  const [lastFixTs, setLastFixTs] = useState<number | null>(null)
+  const [now, setNow] = useState(() => Date.now())
   const selectedRef = useRef(selected)
   selectedRef.current = selected
+
+  // 1s ticker driving the "X ago" freshness text.
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [])
 
   const loadSessions = useCallback(async () => {
     try {
       const rows = await fetchSessions()
       setSessions(rows)
+      if (rows.length > 0) {
+        const newest = Math.max(...rows.map((r) => r.ended_at))
+        setLastFixTs((prev) => Math.max(prev ?? 0, newest))
+      }
       // auto-select the most recent session on first load
       if (!selectedRef.current && rows.length > 0) {
         setSelected({ device: rows[0].device_id, session: rows[0].session_id })
       }
     } catch {
-      /* feed offline; the status badge covers it */
+      /* feed offline; the status indicator covers it */
     }
   }, [])
 
@@ -105,39 +129,63 @@ export default function App() {
     return () => clearInterval(id)
   }, [loadSessions])
 
-  // load points when selection changes
+  // load points + video segments when selection changes
   useEffect(() => {
     if (!selected) return
     fetchPoints(selected.device, selected.session)
       .then(setPoints)
       .catch(() => setPoints([]))
+    fetchMedia(selected.device, selected.session)
+      .then(setMedia)
+      .catch(() => setMedia([]))
   }, [selected])
 
-  // live stream: append points for the selected session; refresh the list
+  // live stream: append points/segments for the selected session; refresh the list
   useEffect(() => {
-    const unsub = subscribeStream((incoming: StreamPoint[]) => {
-      setLastLiveAt(Date.now())
-      const sel = selectedRef.current
-      if (sel) {
-        const mine = incoming.filter(
-          (p) => p.session_id === sel.session && (p.device_id ?? null) === (sel.device ?? null),
-        )
-        if (mine.length > 0) {
-          setPoints((prev) => {
-            const seen = new Set(prev.map((p) => p.point_id))
-            const fresh = mine.filter((p) => !seen.has(p.point_id))
-            return fresh.length > 0 ? [...prev, ...fresh] : prev
-          })
+    const unsub = subscribeStream(
+      (incoming: StreamPoint[]) => {
+        if (incoming.length > 0) {
+          const newest = Math.max(...incoming.map((p) => p.timestamp))
+          setLastFixTs((prev) => Math.max(prev ?? 0, newest))
         }
-      }
-      loadSessions()
-    }, setConnected)
+        const sel = selectedRef.current
+        if (sel) {
+          const mine = incoming.filter(
+            (p) => p.session_id === sel.session && (p.device_id ?? null) === (sel.device ?? null),
+          )
+          if (mine.length > 0) {
+            setPoints((prev) => {
+              const seen = new Set(prev.map((p) => p.point_id))
+              const fresh = mine.filter((p) => !seen.has(p.point_id))
+              return fresh.length > 0 ? [...prev, ...fresh] : prev
+            })
+          }
+        }
+        loadSessions()
+      },
+      setConnected,
+      (segment: MediaSegment) => {
+        const sel = selectedRef.current
+        if (
+          sel &&
+          segment.session_id === sel.session &&
+          (segment.device_id ?? null) === (sel.device ?? null)
+        ) {
+          setMedia((prev) =>
+            prev.some((s) => s.id === segment.id) ? prev : [...prev, segment],
+          )
+        }
+        loadSessions()
+      },
+    )
     return () => unsub()
   }, [loadSessions])
 
-  const live = lastLiveAt != null && Date.now() - lastLiveAt < 30000
+  const live = connected && lastFixTs != null && now - lastFixTs < LIVE_WINDOW_MS
+  const feedStatus: FeedStatus = !connected ? 'offline' : live ? 'live' : 'stale'
 
   const playback = usePlayback(points)
+  const mediaCache = useMediaCache(media, playback.playheadTs)
 
   const stats = useMemo(() => {
     const coords = points.filter((p) => p.lat != null && p.lon != null)
@@ -150,139 +198,191 @@ export default function App() {
     }
     const last = points[points.length - 1]
     const first = points[0]
-    const speeds = points.map((p) => p.speed ?? 0)
-    const maxSpeed = speeds.length ? Math.max(...speeds) : 0
     return {
       count: points.length,
       distanceMi: dist / 1609.344,
       durationMs: last && first ? last.timestamp - first.timestamp : 0,
-      lastSpeedMph: (last?.speed ?? 0) * MPS_TO_MPH,
-      maxSpeedMph: maxSpeed * MPS_TO_MPH,
-      altitudeFt: last?.altitude != null ? last.altitude * M_TO_FT : null,
-      battery: last?.device_battery != null ? Math.round(last.device_battery * 100) : null,
-      charging: last?.battery_charging === 1,
       lastFix: last ? new Date(last.timestamp).toLocaleTimeString() : null,
-      network: last?.network_type ?? null,
     }
   }, [points])
 
+  // Static top speed over the whole path (max recorded fix speed).
+  const topSpeedMph = useMemo(() => {
+    let max: number | null = null
+    for (const p of points) {
+      if (p.speed != null && (max == null || p.speed > max)) max = p.speed
+    }
+    return max != null ? max * MPS_TO_MPH : null
+  }, [points])
+
+  // Stats at the playhead position, driving the HUD during playback.
+  // Uses the same bracketing-fix logic as TrackMap's interpolated marker.
+  const playheadStats = useMemo((): HudStats | null => {
+    const ts = playback.playheadTs
+    if (ts == null) return null
+    const timed = points.filter((p) => p.lat != null && p.lon != null) as (Point & {
+      lat: number
+      lon: number
+    })[]
+    if (timed.length === 0) return null
+    let i = 0
+    while (i + 1 < timed.length && timed[i + 1].timestamp <= ts) i++
+    let dist = 0
+    for (let k = 1; k <= i; k++) {
+      dist += haversineMeters([timed[k - 1].lat, timed[k - 1].lon], [timed[k].lat, timed[k].lon])
+    }
+    const a = timed[i]
+    const b = timed[i + 1]
+    if (b && ts > a.timestamp) {
+      const f = Math.min(1, (ts - a.timestamp) / (b.timestamp - a.timestamp))
+      dist += f * haversineMeters([a.lat, a.lon], [b.lat, b.lon])
+    }
+    const altM = mslAltitudeM(a)
+    return {
+      speedMph: a.speed != null ? a.speed * MPS_TO_MPH : null,
+      topSpeedMph,
+      distanceMi: dist / 1609.344,
+      elapsedMs: ts - timed[0].timestamp,
+      totalMs: timed[timed.length - 1].timestamp - timed[0].timestamp,
+      altitudeFt: altM != null ? altM * M_TO_FT : null,
+      battery: a.device_battery != null ? Math.round(a.device_battery * 100) : null,
+      charging: a.battery_charging === 1,
+      clockTs: ts,
+    }
+  }, [points, playback.playheadTs, topSpeedMph])
+
+  // Latest-fix stats, driving the HUD outside playback (live/idle view).
+  const latestStats = useMemo((): HudStats | null => {
+    const last = points[points.length - 1]
+    if (last == null) return null
+    const altM = mslAltitudeM(last)
+    return {
+      speedMph: last.speed != null ? last.speed * MPS_TO_MPH : null,
+      topSpeedMph,
+      distanceMi: stats.distanceMi,
+      elapsedMs: stats.durationMs,
+      totalMs: stats.durationMs,
+      altitudeFt: altM != null ? altM * M_TO_FT : null,
+      battery: last.device_battery != null ? Math.round(last.device_battery * 100) : null,
+      charging: last.battery_charging === 1,
+      clockTs: last.timestamp,
+    }
+  }, [points, stats, topSpeedMph])
+
+  const hudStats = playheadStats ?? latestStats
+
   return (
-    <div className="mx-auto flex min-h-screen max-w-7xl flex-col gap-4 p-4 lg:p-6">
-      {/* header */}
-      <header className="flex items-center justify-between">
+    <div className="flex min-h-screen flex-col lg:grid lg:h-screen lg:min-h-0 lg:grid-cols-[260px_minmax(0,1fr)_300px] lg:grid-rows-[48px_minmax(0,1fr)]">
+      {/* header strip */}
+      <header className="flex h-12 shrink-0 items-center gap-3 border-b bg-card px-3 lg:col-span-3 lg:h-full">
         <div className="flex items-center gap-2.5">
-          <div className="flex size-9 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-            <Navigation className="size-5" />
+          <div className="flex size-8 items-center justify-center bg-primary text-primary-foreground">
+            <Navigation className="size-4" />
           </div>
-          <div>
-            <h1 className="text-lg font-semibold leading-tight">geowise</h1>
-            <p className="text-xs text-muted-foreground">Live tracking dashboard</p>
-          </div>
+          <h1 className="text-sm font-semibold uppercase tracking-wider">geowise</h1>
         </div>
-        <div className="flex items-center gap-2">
-          <Badge variant={connected ? 'success' : 'muted'}>
-            <span
-              className={cn(
-                'size-1.5 rounded-full',
-                connected ? 'bg-[color:var(--go)]' : 'bg-muted-foreground',
-              )}
-            />
-            {connected ? (live ? 'Live' : 'Connected') : 'Feed offline'}
-          </Badge>
-          <Button variant="outline" size="sm" onClick={loadSessions}>
-            <RefreshCw /> Refresh
-          </Button>
-        </div>
+        <div className="flex-1" />
+        <FeedIndicator
+          status={feedStatus}
+          lastFixTs={lastFixTs}
+          now={now}
+          dimmed={playback.active}
+        />
+        <div className="flex-1" />
+        <Button variant="ghost" size="sm" onClick={loadSessions}>
+          <RefreshCw /> Refresh
+        </Button>
       </header>
 
-      {/* stats */}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-6">
-        <Stat
-          icon={Gauge}
-          label="Speed"
-          value={stats.lastSpeedMph.toFixed(1)}
-          sub={`mph · max ${stats.maxSpeedMph.toFixed(1)}`}
-          accent={live}
-        />
-        <Stat icon={Route} label="Distance" value={stats.distanceMi.toFixed(2)} sub="miles" />
-        <Stat
-          icon={Clock}
-          label="Duration"
-          value={stats.durationMs > 0 ? fmtDuration(stats.durationMs) : '—'}
-          sub={stats.lastFix ? `last fix ${stats.lastFix}` : undefined}
-        />
-        <Stat icon={MapPin} label="Points" value={String(stats.count)} sub="gps fixes" />
-        <Stat
-          icon={Activity}
-          label="Altitude"
-          value={stats.altitudeFt != null ? stats.altitudeFt.toFixed(0) : '—'}
-          sub="feet"
-        />
-        <Stat
-          icon={stats.charging ? BatteryCharging : Battery}
-          label="Battery"
-          value={stats.battery != null ? `${stats.battery}%` : '—'}
-          sub={stats.charging ? 'charging' : (stats.network ?? undefined)}
-        />
-      </div>
+      {/* sessions rail (left on desktop, last on mobile) */}
+      <aside className="order-3 flex flex-col border-t lg:order-none lg:min-h-0 lg:border-t-0 lg:border-r">
+        <PanelLabel
+          aside={
+            <span className="font-mono text-[11px] text-muted-foreground">
+              {sessions.length}
+            </span>
+          }
+        >
+          <Satellite className="size-3.5" /> Sessions
+        </PanelLabel>
+        <div className="lg:min-h-0 lg:flex-1 lg:overflow-y-auto">
+          {sessions.length === 0 && (
+            <div className="px-3 py-3 text-xs text-muted-foreground">Waiting for data…</div>
+          )}
+          {sessions.map((s) => {
+            const isSel =
+              selected?.session === s.session_id && selected?.device === s.device_id
+            return (
+              <button
+                key={`${s.device_id}-${s.session_id}`}
+                onClick={() => setSelected({ device: s.device_id, session: s.session_id })}
+                className={cn(
+                  'relative block w-full cursor-pointer border-b px-3 py-2.5 text-left transition-colors hover:bg-accent',
+                  isSel && 'bg-accent',
+                )}
+              >
+                {isSel && <span className="absolute inset-y-0 left-0 w-0.5 bg-primary" />}
+                <div className="flex items-center justify-between">
+                  <span className="flex items-center gap-1.5 text-sm font-medium">
+                    Session {s.session_id}
+                    {s.media_segments > 0 ? (
+                      <Video className="size-3.5 text-muted-foreground" />
+                    ) : null}
+                  </span>
+                  <span className="font-mono text-xs text-muted-foreground">{s.points} pts</span>
+                </div>
+                <div className="mt-0.5 text-xs text-muted-foreground">
+                  {new Date(s.started_at).toLocaleString()}
+                </div>
+                {isSel && stats.lastFix ? (
+                  <div className="mt-0.5 font-mono text-[10px] text-muted-foreground">
+                    {stats.count} pts loaded · last fix {stats.lastFix}
+                  </div>
+                ) : null}
+                {s.device_id ? (
+                  <div className="mt-1 truncate font-mono text-[10px] text-muted-foreground/70">
+                    {s.device_id}
+                  </div>
+                ) : null}
+              </button>
+            )
+          })}
+        </div>
+      </aside>
 
-      {/* map + sessions */}
-      <div className="grid flex-1 grid-cols-1 gap-4 lg:grid-cols-[1fr_300px]">
-        <Card className="min-h-[420px] gap-2 p-2 lg:min-h-[520px]">
-          <div className="min-h-0 flex-1">
-            <TrackMap
-              points={points}
-              live={live && !playback.active}
-              playheadTs={playback.playheadTs}
-            />
-          </div>
+      {/* map fills the center: HUD pinned inside its top edge, playback bar its bottom */}
+      <main className="relative order-1 h-[55vh] lg:order-none lg:h-auto lg:min-h-0">
+        <TrackMap
+          points={points}
+          live={live && !playback.active}
+          playheadTs={playback.playheadTs}
+        />
+        {hudStats && (
+          <MapHud stats={hudStats} mode={playheadStats != null ? 'replay' : 'live'} />
+        )}
+        <div className="absolute inset-x-0 bottom-0 z-[1000]">
           <PlaybackBar playback={playback} />
-        </Card>
+        </div>
+      </main>
 
-        <Card className="gap-3">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Satellite className="size-4" /> Sessions
-            </CardTitle>
-            <CardDescription>
-              {sessions.length === 0 ? 'Waiting for data…' : `${sessions.length} recorded`}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex max-h-[440px] flex-col gap-1.5 overflow-y-auto">
-            {sessions.map((s) => {
-              const isSel =
-                selected?.session === s.session_id && selected?.device === s.device_id
-              return (
-                <button
-                  key={`${s.device_id}-${s.session_id}`}
-                  onClick={() => setSelected({ device: s.device_id, session: s.session_id })}
-                  className={cn(
-                    'cursor-pointer rounded-lg border p-3 text-left transition-colors hover:bg-accent',
-                    isSel && 'border-primary bg-accent',
-                  )}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm font-medium">Session {s.session_id}</span>
-                    <span className="font-mono text-xs text-muted-foreground">{s.points} pts</span>
-                  </div>
-                  <div className="mt-0.5 text-xs text-muted-foreground">
-                    {new Date(s.started_at).toLocaleString()}
-                  </div>
-                  {s.device_id ? (
-                    <div className="mt-1 truncate font-mono text-[10px] text-muted-foreground/70">
-                      {s.device_id}
-                    </div>
-                  ) : null}
-                </button>
-              )
-            })}
-          </CardContent>
-        </Card>
-      </div>
-
-      <footer className="text-center text-xs text-muted-foreground">
-        Feed served locally on 127.0.0.1:3100 — never exposed through the tunnel.
-      </footer>
+      {/* camera rail (right on desktop, strip under the map on mobile) */}
+      <aside className="order-2 border-t lg:order-none lg:min-h-0 lg:border-t-0 lg:border-l">
+        <VideoPanel
+          segments={media}
+          live={live && !playback.active}
+          playheadTs={playback.playheadTs}
+          startTs={playback.startTs}
+          endTs={playback.endTs}
+          playing={playback.playing}
+          speed={playback.speed}
+          urlFor={mediaCache.urlFor}
+          cacheLoaded={mediaCache.loaded}
+          cacheTotal={mediaCache.total}
+          onScrub={playback.seek}
+          onPlayToggle={(p) => (p ? playback.play() : playback.pause())}
+          onClockSync={playback.syncTo}
+        />
+      </aside>
     </div>
   )
 }

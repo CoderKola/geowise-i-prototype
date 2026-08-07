@@ -16,6 +16,7 @@ import {
   deleteSessionData,
   deleteUploadedPoints,
 } from '../db/points';
+import { deleteUploadedSegments } from '../db/media';
 import { exportSessionCsv } from '../export/csv';
 import { ACCENT } from '../theme';
 import type { Session } from '../types';
@@ -82,6 +83,7 @@ export default function HistoryScreen() {
           style: 'destructive',
           onPress: async () => {
             await deleteUploadedPoints();
+            await deleteUploadedSegments(); // synced video files too
             await load();
             await u.refreshCounts();
           },

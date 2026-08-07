@@ -29,6 +29,12 @@ apps/mobile/android
 apps/server/.env
 apps/server/*.db
 apps/server/*.db-*
+# uploaded ride video chunks (user data, large binaries)
+apps/server/media/
+# stray empty copy created by running sqlite3 from the repo root
+/geowise-ingest.db*
+# session CSV exports saved to the repo root during testing
+/session-*.csv
 
 # web dashboard (apps/web) build output
 apps/web/dist/

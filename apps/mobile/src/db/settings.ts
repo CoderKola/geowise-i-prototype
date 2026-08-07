@@ -45,3 +45,35 @@ export async function saveUploadSettings(s: UploadSettings): Promise<void> {
   await setSetting('upload_token', s.uploadToken.trim());
   await setSetting('upload_enabled', s.uploadEnabled ? '1' : '0');
 }
+
+// --- active recording session ---
+// Persisted so the background location task (which may run after the app was
+// killed and relaunched headlessly) knows which session to append points to.
+
+export interface ActiveSession {
+  sessionId: number;
+  deviceId: string | null;
+}
+
+export async function getActiveSession(): Promise<ActiveSession | null> {
+  const [sid, deviceId] = await Promise.all([
+    getSetting('active_session_id'),
+    getSetting('active_device_id'),
+  ]);
+  if (sid == null) return null;
+  const sessionId = Number(sid);
+  if (!Number.isFinite(sessionId)) return null;
+  return { sessionId, deviceId: deviceId || null };
+}
+
+export async function setActiveSession(sessionId: number, deviceId: string | null): Promise<void> {
+  await setSetting('active_session_id', String(sessionId));
+  await setSetting('active_device_id', deviceId ?? '');
+}
+
+export async function clearActiveSession(): Promise<void> {
+  const db = await getDb();
+  await db.runAsync(
+    "DELETE FROM meta WHERE key IN ('active_session_id', 'active_device_id')"
+  );
+}

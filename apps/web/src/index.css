@@ -3,7 +3,8 @@
 
 /* shadcn/ui design tokens — LIGHT only (per product decision). */
 :root {
-  --radius: 0.65rem;
+  /* Square-edged "console" look: no rounding anywhere. */
+  --radius: 0rem;
 
   --background: oklch(0.99 0.002 260);
   --foreground: oklch(0.21 0.02 260);
@@ -34,10 +35,11 @@
 }
 
 @theme inline {
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) + 4px);
+  /* All zero — square edges everywhere (calc offsets would leak 4px on xl). */
+  --radius-sm: 0rem;
+  --radius-md: 0rem;
+  --radius-lg: 0rem;
+  --radius-xl: 0rem;
 
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -76,4 +78,11 @@
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
   }
+}
+
+/* The playback bar (44px) overlays the map's bottom edge — keep leaflet's
+   bottom controls (zoom, attribution) visible above it. Unlayered so it
+   outranks leaflet.css (rules inside @layer lose to unlayered imports). */
+.leaflet-bottom {
+  bottom: 44px;
 }

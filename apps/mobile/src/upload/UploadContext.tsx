@@ -9,7 +9,10 @@ import React, {
 import { AppState } from 'react-native';
 import { getUploadSettings, saveUploadSettings } from '../db/settings';
 import { countPending, countUploaded } from '../db/points';
-import { syncOnce } from './uploader';
+import { countPendingSegments, countUploadedSegments } from '../db/media';
+import { cleanupUploadedSegments } from '../db/mediaCleanup';
+import { drainQueue } from './uploader';
+import { ensureBackgroundFlushRegistered } from './backgroundSync';
 
 const INTERVAL_MS = 12000; // foreground sync cadence
 
@@ -20,6 +23,8 @@ interface UploadState {
   uploadEnabled: boolean;
   pending: number;
   sent: number;
+  pendingMedia: number;
+  sentMedia: number;
   lastStatus: string | null;
   lastSyncAt: number | null;
 }
@@ -40,6 +45,8 @@ const initialState: UploadState = {
   uploadEnabled: false,
   pending: 0,
   sent: 0,
+  pendingMedia: 0,
+  sentMedia: 0,
   lastStatus: null,
   lastSyncAt: null,
 };
@@ -67,6 +74,11 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
         pending,
         sent,
       }));
+      // OS-level flush so the queue drains even if the app is backgrounded
+      // or killed after a ride. The task itself checks the Auto toggle.
+      await ensureBackgroundFlushRegistered();
+      // App-start retention pass: drop synced video files older than 24h.
+      await cleanupUploadedSegments().catch(() => {});
     })();
   }, []);
 
@@ -80,8 +92,13 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
   }, [state.serverUrl, state.uploadToken, state.uploadEnabled]);
 
   const refreshCounts = useCallback(async () => {
-    const [pending, sent] = await Promise.all([countPending(), countUploaded()]);
-    setState((prev) => ({ ...prev, pending, sent }));
+    const [pending, sent, pendingMedia, sentMedia] = await Promise.all([
+      countPending(),
+      countUploaded(),
+      countPendingSegments(),
+      countUploadedSegments(),
+    ]);
+    setState((prev) => ({ ...prev, pending, sent, pendingMedia, sentMedia }));
   }, []);
 
   // force=true is the manual "Sync now" path — flushes even when auto is off.
@@ -92,13 +109,15 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
     if (AppState.currentState !== 'active') return; // foreground-only
     busyRef.current = true;
     try {
-      const r = await syncOnce(url, token);
+      // Drain the whole queue, not just one batch — after a ride with a
+      // backlog this catches the server up in one tick instead of hours.
+      const r = await drainQueue(url, token);
       setState((prev) => ({
         ...prev,
         lastStatus: r.error
           ? `error: ${r.error}`
-          : r.sent > 0
-            ? `sent ${r.sent}`
+          : r.sent > 0 || r.sentMedia > 0
+            ? `sent ${r.sent}${r.sentMedia > 0 ? ` + ${r.sentMedia} clips` : ''}`
             : 'up to date',
         lastSyncAt: Date.now(),
       }));
@@ -111,6 +130,7 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
   // periodic tick: always refresh counts; sync only when enabled/active
   useEffect(() => {
     const tick = async () => {
+      await cleanupUploadedSegments().catch(() => {}); // no-op unless synced chunks aged out
       await refreshCounts();
       await runSync();
     };

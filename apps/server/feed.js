@@ -1,5 +1,6 @@
 const express = require('express');
-const { listSessions, sessionPoints } = require('./db');
+const path = require('path');
+const { listSessions, sessionPoints, sessionMedia, mediaSegmentById, MEDIA_DIR } = require('./db');
 
 // Dashboard feed — READ ONLY, bound to 127.0.0.1 ONLY, NEVER tunneled.
 // This is the deliberate security split: the public tunnel exposes only the
@@ -36,6 +37,25 @@ function startFeed(bus) {
     res.json({ points: sessionPoints(deviceId, sessionId) });
   });
 
+  // Video segment metadata for a session (files served separately below).
+  app.get('/api/media', (req, res) => {
+    const deviceId = req.query.device_id ?? null;
+    const sessionId = req.query.session_id != null ? Number(req.query.session_id) : null;
+    if (sessionId == null || Number.isNaN(sessionId)) {
+      return res.status(400).json({ ok: false, error: 'session_id required' });
+    }
+    res.json({ segments: sessionMedia(deviceId, sessionId) });
+  });
+
+  // Stream one segment's MP4. sendFile handles Range requests, which the
+  // browser <video> element uses for seeking.
+  app.get('/api/media/:id/file', (req, res) => {
+    const id = Number(req.params.id);
+    const row = Number.isFinite(id) ? mediaSegmentById(id) : undefined;
+    if (!row) return res.status(404).json({ ok: false, error: 'not found' });
+    res.sendFile(path.join(MEDIA_DIR, row.file_path));
+  });
+
   // Server-Sent Events: push each freshly-ingested batch to the browser live.
   app.get('/api/stream', (req, res) => {
     res.set({
@@ -51,10 +71,17 @@ function startFeed(bus) {
     };
     bus.on('points', onPoints);
 
+    // Named event so the default onmessage (points) handler is unaffected.
+    const onMedia = (segment) => {
+      res.write(`event: media\ndata: ${JSON.stringify(segment)}\n\n`);
+    };
+    bus.on('media', onMedia);
+
     const keepAlive = setInterval(() => res.write(': ka\n\n'), 15000);
     req.on('close', () => {
       clearInterval(keepAlive);
       bus.off('points', onPoints);
+      bus.off('media', onMedia);
     });
   });
 
