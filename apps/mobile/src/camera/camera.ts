@@ -31,6 +31,14 @@ const VIDEO_TARGET = { width: 720, height: 1280 }; // 720p — battery/bandwidth
 // without a library upgrade. 3 Mbps ≈ 5.6 MB per 15 s chunk.
 const VIDEO_BITRATE_BPS = 3_000_000;
 
+// Cap capture at 20 fps. Field data (8/10 ride) showed the encoder can't
+// sustain dual 720p30: chunks held 15 s of frames across up to ~25 s of wall
+// time, i.e. ~40% of real time was never captured ("choppy" footage). 20 fps
+// cuts pipeline load by a third and is plenty for ride review. Applied as a
+// session CONSTRAINT — vision-camera negotiates the closest supported rate,
+// so an unsupported value degrades gracefully instead of failing.
+const VIDEO_FPS = 20;
+
 // EXPERIMENTAL SPIKE (plan items 1+3), default OFF: keep recording while the
 // screen is off / app is backgrounded. Requires an EAS build with the
 // camera-type foreground service (plugins/withCameraForegroundService.js) and
@@ -393,7 +401,7 @@ export async function startCapture(
           { output: captures[i].previewOutput, mirrorMode: 'auto' as const },
           { output: captures[i].videoOutput, mirrorMode: facing === 'front' ? ('on' as const) : ('off' as const) },
         ],
-        constraints: [],
+        constraints: [{ fps: VIDEO_FPS }],
       }))
     );
     await session.start();
