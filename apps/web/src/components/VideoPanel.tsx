@@ -122,9 +122,24 @@ function FacingTile({
     return segments[segments.length - 1] // newest (live or idle)
   }, [segments, playheadTs])
 
+  // Media-seconds per wall-second for a loaded chunk. Under encoder overload
+  // (dual-cam), the phone produces 15s of frames over MORE than 15s of wall
+  // time — e.g. a 25s wall span holding a 15s file (scale 0.6). All wall<->
+  // media time conversions must go through this or the video overshoots the
+  // playhead mid-chunk and freezes ("choppy" replay). 1 until metadata loads.
+  const chunkScale = (el: HTMLVideoElement | null, seg: MediaSegment): number => {
+    if (el == null) return 1
+    const spanS = (seg.ended_at - seg.started_at) / 1000
+    const dur = el.duration
+    return Number.isFinite(dur) && dur > 0 && spanS > 0 ? Math.min(1, dur / spanS) : 1
+  }
+
   const seekTo = (el: HTMLVideoElement, seg: MediaSegment) => {
     if (playheadTs != null) {
-      el.currentTime = Math.max(0, (playheadTs - seg.started_at) / 1000)
+      el.currentTime = Math.max(
+        0,
+        ((playheadTs - seg.started_at) / 1000) * chunkScale(el, seg),
+      )
     }
   }
 
@@ -185,18 +200,22 @@ function FacingTile({
     const el = elFor(active)
     if (el == null || entry == null) return
     const seg = entry.seg
-    const masterDrives = isMaster && playing && speed <= MAX_VIDEO_RATE
+    const scale = chunkScale(el, seg)
+    // Effective playback rate honors the chunk's time-scale: a chunk holding
+    // 15s of media across a 25s wall span must play at 0.6x per 1x of session
+    // time to stay in step with the map.
+    const rate = Math.min(speed * scale, MAX_VIDEO_RATE)
+    const masterDrives = isMaster && playing && speed * scale <= MAX_VIDEO_RATE
     if (!masterDrives) {
-      const target = (playheadTs - seg.started_at) / 1000
-      const segLenS = (seg.ended_at - seg.started_at) / 1000
+      const target = ((playheadTs - seg.started_at) / 1000) * scale
+      const mediaLenS = ((seg.ended_at - seg.started_at) / 1000) * scale
       const slack = playing ? Math.max(0.75, speed * 0.35) : 0.25
       // Only correct within this chunk's own range — while the NEXT chunk is
       // still loading, let the visible one run out naturally (no rewinding).
-      if (target >= 0 && target <= segLenS + 1 && Math.abs(el.currentTime - target) > slack) {
+      if (target >= 0 && target <= mediaLenS + 1 && Math.abs(el.currentTime - target) > slack) {
         el.currentTime = Math.max(0, target)
       }
     }
-    const rate = Math.min(speed, MAX_VIDEO_RATE)
     if (el.playbackRate !== rate) el.playbackRate = rate
     if (playing && el.paused && !el.ended) {
       el.play().catch(() => {}) // muted, so autoplay policy allows it
@@ -209,7 +228,8 @@ function FacingTile({
     const entry = slotSegs[slot]
     const el = elFor(slot)
     if (entry == null || el == null) return null
-    return entry.seg.started_at + el.currentTime * 1000
+    // Inverse of the wall->media mapping: frame position back to wall-clock.
+    return entry.seg.started_at + (el.currentTime / chunkScale(el, entry.seg)) * 1000
   }
 
   // timeupdate on the visible slot: refresh the frame-time overlay, and — for
@@ -219,9 +239,11 @@ function FacingTile({
     if (slot !== active) return
     const ts = tsAt(slot)
     if (ts != null) setFrameTs(ts)
-    if (!isMaster || live || !playing || speed > MAX_VIDEO_RATE) return
+    if (!isMaster || live || !playing) return
     const el = elFor(slot)
     if (el == null || el.paused || el.seeking) return
+    const entry = slotSegs[slot]
+    if (entry == null || speed * chunkScale(el, entry.seg) > MAX_VIDEO_RATE) return
     if (ts != null) onClockSync(ts)
   }
 
